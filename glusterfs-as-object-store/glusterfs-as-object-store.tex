@@ -1,0 +1,239 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[a4paper,margin=0.7in]{geometry}
+\usepackage{color}
+\usepackage{marginnote} 
+\usepackage{minted}
+\usepackage{multicol}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{epigraph}
+
+\setlength\columnsep{30pt}
+%\setlength\columnseprule{.4pt}
+
+\setlength{\skip\footins}{2cm}
+
+% Customization provided by the enumitem package to
+% remove left indentation for lists
+\setlist[itemize]{leftmargin=*}
+
+\title{GlusterFS as an Object Store}
+\author{
+	Aravinda Vishwanathapura\\
+	\texttt{aravinda@kadalu.io}
+}
+\date{
+	Draft v0.1 Apr 23, 2021\\
+	Draft v0.2 Apr 26, 2021\\
+	Draft v0.3 Apr 30, 2021\\
+}
+
+\setlength{\parskip}{1em}
+\setlength{\parindent}{0pt}
+\setminted{breaklines=true, breakanywhere=true}
+\setmintedinline{breaklines=true, breakanywhere=true}
+\newcommand{\quotes}[1]{``#1''}
+
+\begin{document}
+\maketitle
+
+% * allows to have unbalanced columns in last page.
+\begin{multicols*}{2}
+GlusterFS \footnote{\url{https://gluster.org}} is a Open source scalable network filesystem.
+
+GlusterFS already provides rich APIs to interact with the file system other than Fuse. Libgfapi is used by many integrations like NFS Ganesha \footnote{\url{https://github.com/nfs-ganesha/nfs-ganesha/tree/next/src/FSAL/FSAL_GLUSTER}}, Samba \footnote{\url{https://www.samba.org/samba/docs/current/man-html/vfs_glusterfs.8.html}}, Qemu integration \footnote{\url{https://github.com/qemu/qemu/blob/266469947161aa10b1d36843580d369d5aa38589/block/gluster.c}} etc. This article provides a possible way to use GlusterFS as object storage.
+
+Many existing solutions like Minio\footnote{\url{https://kadalu.io/docs/k8s-storage/latest/running-minio/}} \footnote{\url{https://vinayak-hariharmath.medium.com/how-to-export-gluster-volume-as-an-s3-compliant-object-store-fe4a7d31bf7a}} \footnote{\url{https://gist.github.com/harshavardhana/bda9b18d40f9b733e32eaa3b0736ca70}}, OpenStack Swift\footnote{\url{https://github.com/gluster/gluster-swift}} can provide Object storage on top of GlusterFS mount. Why this project instead of reusing the existing ones?
+
+\begin{itemize}
+\item Libgfapi is already providing APIs. The gap is tiny to complete the Story.
+\item As mentioned above, Libgfapi is a stable interface and used in production with many integrations.
+\item Avoiding the Fuse layer by using LibGfapi is a huge win! Better Performance.
+\item Get all the benefits of GlusterFS instead of using a new Object Storage.
+\end{itemize}
+
+\section{Hello World!}
+\texttt{glfsio}\footnote{Coming Soon..} is a tool created by Kadalu team to provide Object interface to GlusterFS volumes by using \texttt{libgfapi}. Update the configuration file as required and run \texttt{glfsio} using,
+
+\begin{minted}{yaml}
+# config.yaml
+---
+volume: "gvol1"
+rootdir: "/records"
+servers: ["node1.example.com", "node2.example.com", "node3.example.com"]
+immutable: false
+enable_deletes: true
+enable_versions: false
+enable_dedup: true
+port: 4000
+\end{minted}
+
+\begin{minted}{console}
+# ./glfsio --config=/etc/glfsio/config.yaml
+glfsio server is ready at http://0.0.0.0:4000
+\end{minted}
+
+\textbf{Note}: \texttt{libgfapi.so} should be available in the node where \texttt{glfsio} is running.
+
+Now create a Python/Ruby/NodeJS script to interact with the service.
+
+\begin{minted}{ruby}
+require "glfsio"
+
+volume = GlusterFSVolume.new(
+    GLFSIO_SERVER_URL, "gvol1"
+)
+volume.create_file("/hello.txt", "Hello World!")
+puts volume.read_file("/hello.txt")  # Hello World!
+\end{minted}
+
+\section{Features}
+\begin{itemize}
+\item \textbf{De-duplication} Content Hash is used as the file name in the backend. With this, we get de-duplication for free!
+\item \textbf{Immutability} Complete Volume can be made immutable or a selected bucket/directory/file can be made immutable depending on the requirement.
+\item \textbf{Versions} Since the content hash changes if the file content is edited, each edit can be stored as a new version. Retention period can be configured once Versions are enabled. Versions can be enabled or disabled at bucket/directory level.
+\item \textbf{Sub directory support} If the portion of Volume to be used as Object Store then configure that sub-directory as the root directory.
+\item \textbf{Replication and Data high availability} Underlaying GlusterFS Volume takes care of the high availability and data redundancy.
+\item \textbf{All GlusterFS features} All features of the GlusterFS like Geo-replication, Snapshots, Tiering, Quota etc are available with this project.
+\end{itemize}
+
+\section{APIs}
+\subsection{Create File}
+
+Creating a file using HTTP POST will calculate the content hash and stores the actual data with hash value as the file name. The Object metadata are stored in Db for quick access later.
+
+Read the file content and then calculate the Hash value. Now copy the uploaded file inside the \texttt{.store} directory with the name as the hash value.
+
+\begin{minted}{ruby}
+volume.create_file("/hello.txt", "Hello World!")
+volume.create_directory("/images")
+imagedata = File.read("/uploads/logo.png")
+volume.create_file("/images/logo.png", imagedata)
+volume.list_files("/images")  //  ["logo.png"]
+\end{minted}
+
+\begin{itemize}
+\item Read the uploaded file content and calculate the file hash(\texttt{sha256}).
+\item Create a file in the GlusterFS volume with the name same as the Hash of the file.
+\item Create a hard link file with the name same as the uploaded file to the file created in the previous step.
+\item Add entry to \texttt{.meta.db} in the respective directory.
+\end{itemize}
+
+The following pseudo-code to understand the steps when \texttt{POST /gvol1/v1/file1} api is called.
+
+\begin{minted}{ruby}
+content = File.read("/uploads/file1")  # Hello World!
+hash = hash_sha256(content)  # 03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340
+hash_file_path = ".store/#{hash[0,2]}/#{hash[2,2]}/#{hash}"  # .store/03/ba/03ba204e50d126e...
+
+if !file_exists(hash_file_path)
+    rename_file("/uploads/file1", hash_file_path)
+end
+
+create_hardlink(hash_file_path, "file1")
+
+sqlite_add_file(".meta.db", "file1", ...)
+\end{minted}
+
+\subsection{Edit a File}
+
+This option is enabled only if \texttt{immutable=false}. Edit API will recalculate the content hash and does the necessary relinking. Keep the old content if \texttt{enable\_versions=true}.
+
+Calculate the new content hash and then check for that hash existence. If not exists, create a new hash file in the \texttt{.store} directory. Delete the old hash file if no other hard links exist (that is if link count is 1) and if version support is not required. Move to the .versions directory if all the versions of the file to be maintained. Refer Version support section.
+
+\begin{minted}{ruby}
+volume.update_file("/hello.txt", "Hello World again!")
+\end{minted}
+
+The following pseudo-code to understand the steps when \texttt{PUT /gvol1/v1/file1} api is called.
+
+\begin{minted}{ruby}
+new_content = File.read("/uploads/file1")  # Hello World!
+new_hash = hash_sha256(content)  # 03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340
+new_hash_file_path = ".store/#{hash[0,2]}/#{hash[2,2]}/#{hash}"  # .store/03/ba/03ba204e50d126e...
+
+current_hash = get_current_hash("file1.txt")
+
+if !file_exists(new_hash_file_path)
+    rename_file("/uploads/file1.txt", new_hash_file_path)
+end
+
+create_hardlink(new_hash_file_path, "file1")
+
+if number_of_hardlinks(current_hash) == 1
+	delete_hardlink(current_hash)
+end
+
+sqlite_update_file(".meta.db", "file1", ...)
+\end{minted}
+
+\subsection{Read the content}
+
+A file can be read in two ways. One using the file name used while creating the file, and the other way is by using the File hash. Internally both are the same since these are hard links in the GlusterFS Volume.
+
+\begin{minted}{ruby}
+volume.read_file("/hello.txt")  # Hello World!
+volume.read_file("03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340")  # Hello World!
+\end{minted}
+
+\subsection{Delete file or Directory}
+\begin{minted}{ruby}
+volume.delete_file("/hello.txt")
+\end{minted}
+
+This option is enabled only if \texttt{immutable=false} and \texttt{enable\_deletes=true}. Following steps will be run when a file is deleted.
+
+\begin{itemize}
+\item Get the Hash of the file from the xattr or db.
+\item Delete the file
+\item Delete the hash file only if the link count is 1
+\item Remove entry from respective directory's \texttt{.meta.db} file.
+\item Remove all versions of the file if exists.
+\end{itemize}
+
+\subsection{Renaming the files and directories}
+
+\begin{minted}{ruby}
+volume.rename_file("/hello.txt", "/hello_world.txt")
+\end{minted}
+
+\subsection{Listing the directories}
+
+Directory listing is optimised by keeping the files list in a database(SQLite3) in the respective directory. Listing files is equivalent to the following command.
+
+\begin{minted}{sql}
+-- List of files
+SELECT * FROM files;
+
+-- Directory utilization
+SELECT sum(size) AS utilization FROM files;
+\end{minted}
+
+\subsection{Storage Accounting}
+Each directory maintains its accounting in the \texttt{.meta.db} file. Aggregated information will be tracked in Project root directory. 
+
+\section{Version Control}
+If version support is enabled, then maintain the hard links under the \texttt{.versions} directory. These versioned files are maintained by appending version information to the existing file paths.
+
+\section{Configurations}
+\begin{itemize}
+\item \textbf{De-dupe support} This can be disabled if de-duplication is not required.
+\item \textbf{Version support} Version support is disabled by default, but This can be enabled when required.
+\item \textbf{Access optimisations} If the frequency of accessing files using hash more than the Path then the approach of creating the file can be optimised. For example, if the hash file is created first then if the file by path is hard-linked then if the file path hashes to a different distribution group then GlusterFS creates a link-to file in the hashed brick and the actual content is in another brick. This may increase the latency to access the file. If the files are accessed using Path more often than the hash then Create a file with the actual name first and then create a hard link with the name as a hash.
+\item \textbf{Root directory} If only one portion or directory of a GlusterFS volume needs to be converted as an Object store, then root dir can be configured as required.
+\item \textbf{Immutable} With these configurations, Edit and delete will not be available. Once created it will stay in the GlusterFS Volume.
+\item \textbf{ACL} TBD
+\end{itemize}
+
+\section{What next?}
+\begin{itemize}
+\item Even though this solution is usable in its current state, the S3 compatibility layer will benefit more users.
+\item Implement Volume and Directory level Access control.
+\item Caching layer for better read performance.
+\end{itemize}
+
+\end{multicols*}
+\end{document}
+
